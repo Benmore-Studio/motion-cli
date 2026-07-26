@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""motion — a tiny, dependency-free CLI for Motion, the agent-driven personal CRM.
+
+Auth is OAuth 2.1 (PKCE) against your Motion instance's built-in authorization
+server — the same login your AI agent uses. Everything else is a thin call to
+Motion's MCP tools, plus local iMessage sending via AppleScript on macOS.
+
+Config/token live in ~/.config/motion/config.json.
+Point at a different instance with the MOTION_URL env var (default: the hosted app).
+"""
+import argparse, base64, hashlib, http.server, json, os, secrets, socket
+import subprocess, sys, threading, urllib.parse, urllib.request, webbrowser
+
+DEFAULT_URL = os.environ.get("MOTION_URL", "https://motion-v9t7fg.benmore.ai").rstrip("/")
+CFG_DIR = os.path.expanduser("~/.config/motion")
+CFG_PATH = os.path.join(CFG_DIR, "config.json")
+
+
+# ---------- config ----------
+def load_cfg():
+    try:
+        with open(CFG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cfg(cfg):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    with open(CFG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CFG_PATH, 0o600)
+
+
+def base_url(cfg):
+    return (cfg.get("base") or DEFAULT_URL).rstrip("/")
+
+
+# ---------- http ----------
+def http(method, url, token=None, body=None, form=False):
+    data, headers = None, {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if body is not None:
+        if form:
+            data = urllib.parse.urlencode(body).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as r:
+            raw = r.read().decode()
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {"error": raw[:400]}
+    try:
+        return 200, json.loads(raw)
+    except Exception:
+        return 200, raw
+
+
+def die(msg, code=1):
+    print("motion: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def need_token(cfg):
+    tok = cfg.get("token")
+    if not tok:
+        die("not logged in — run `motion login` first")
+    return tok
+
+
+# ---------- MCP ----------
+def mcp(cfg, tool, args):
+    tok = need_token(cfg)
+    url = base_url(cfg) + "/api/mcp"
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool, "arguments": args}}
+    code, resp = http("POST", url, token=tok, body=body)
+    if code == 401:
+        die("session expired — run `motion login` again")
+    if code != 200 or not isinstance(resp, dict):
+        die("request failed (%s): %s" % (code, resp))
+    if "error" in resp:
+        die(str(resp["error"]))
+    try:
+        return resp["result"]["content"][0]["text"]
+    except Exception:
+        return json.dumps(resp)
+
+
+# ---------- OAuth PKCE login ----------
+def b64url(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def cmd_login(cfg, a):
+    base = (a.url or DEFAULT_URL).rstrip("/")
+    code, meta = http("GET", base + "/.well-known/oauth-authorization-server")
+    if code != 200 or not isinstance(meta, dict):
+        die("could not reach Motion's OAuth server at " + base)
+    authorize = meta["authorization_endpoint"]
+    token_ep = meta["token_endpoint"]
+    register = meta.get("registration_endpoint", base + "/oauth/register")
+
+    port = free_port()
+    redirect = "http://127.0.0.1:%d/callback" % port
+
+    # Dynamic client registration (public client, PKCE, no secret).
+    code, reg = http("POST", register, body={
+        "client_name": "Motion CLI", "redirect_uris": [redirect],
+        "grant_types": ["authorization_code"], "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    })
+    if code not in (200, 201) or "client_id" not in reg:
+        die("client registration failed: %s" % reg)
+    client_id = reg["client_id"]
+
+    verifier = b64url(secrets.token_bytes(32))
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    state = secrets.token_urlsafe(16)
+    q = urllib.parse.urlencode({
+        "response_type": "code", "client_id": client_id, "redirect_uri": redirect,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+        "state": state, "scope": "*", "resource": base + "/api/mcp",
+    })
+    auth_url = authorize + "?" + q
+
+    holder = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            p = urllib.parse.urlparse(self.path)
+            if p.path != "/callback":
+                self.send_response(404); self.end_headers(); return
+            qs = urllib.parse.parse_qs(p.query)
+            holder["code"] = qs.get("code", [None])[0]
+            holder["state"] = qs.get("state", [None])[0]
+            holder["error"] = qs.get("error", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body style='font-family:system-ui;text-align:center;"
+                             b"padding-top:20vh'><h2>Motion connected \xe2\x9c\x93</h2>"
+                             b"<p>You can close this tab and return to your terminal.</p></body></html>")
+
+    srv = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    print("Opening your browser to sign in with Google…")
+    print("If it doesn't open, visit:\n  " + auth_url + "\n")
+    webbrowser.open(auth_url)
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    # Wait for the single callback request.
+    srv.socket.settimeout(300)
+    import time
+    for _ in range(600):
+        if holder:
+            break
+        time.sleep(0.5)
+    if not holder or holder.get("error"):
+        die("authorization failed: " + str(holder.get("error") or "timed out"))
+    if holder.get("state") != state:
+        die("state mismatch — aborting for safety")
+
+    code, tok = http("POST", token_ep, form=True, body={
+        "grant_type": "authorization_code", "code": holder["code"],
+        "redirect_uri": redirect, "client_id": client_id, "code_verifier": verifier,
+    })
+    if code != 200 or "access_token" not in tok:
+        die("token exchange failed: %s" % tok)
+
+    cfg.update({"base": base, "client_id": client_id,
+                "token": tok["access_token"], "refresh_token": tok.get("refresh_token", "")})
+    save_cfg(cfg)
+    # Confirm who we are.
+    _, who = http("GET", base + "/api/_auth/profile", token=cfg["token"])
+    email = who.get("email", "") if isinstance(who, dict) else ""
+    print("Logged in%s. You're set — try `motion agenda`." % ((" as " + email) if email else ""))
+
+
+def cmd_logout(cfg, a):
+    try:
+        os.remove(CFG_PATH)
+    except FileNotFoundError:
+        pass
+    print("Logged out.")
+
+
+def cmd_whoami(cfg, a):
+    tok = need_token(cfg)
+    _, who = http("GET", base_url(cfg) + "/api/_auth/profile", token=tok)
+    print(who.get("email", "(unknown)") if isinstance(who, dict) else "(unknown)")
+
+
+# ---------- commands (thin wrappers over MCP tools) ----------
+def cmd_agenda(cfg, a):
+    print(mcp(cfg, "get_agenda", {}))
+
+
+def cmd_queue(cfg, a):
+    print(mcp(cfg, "get_queue", {}))
+
+
+def cmd_due(cfg, a):
+    print(mcp(cfg, "due_sends", {}))
+
+
+def cmd_search(cfg, a):
+    print(mcp(cfg, "search", {"query": a.query}))
+
+
+def cmd_contacts(cfg, a):
+    print(mcp(cfg, "list_targets", {"query": a.query or ""}))
+
+
+def cmd_brief(cfg, a):
+    print(mcp(cfg, "get_brief", {"target_id": a.id}))
+
+
+def cmd_channels(cfg, a):
+    print(mcp(cfg, "list_channels", {}))
+
+
+def cmd_log(cfg, a):
+    args = {"target": a.target, "content": a.content, "kind": a.kind}
+    if a.follow_up:
+        args["follow_up"] = a.follow_up
+    if a.due:
+        args["follow_up_due"] = a.due
+    print(mcp(cfg, "add_context", args))
+
+
+def cmd_send_email(cfg, a):
+    args = {"to": a.to, "subject": a.subject, "body": a.body}
+    if a.target_id:
+        args["target_id"] = a.target_id
+    print(mcp(cfg, "send_email", args))
+
+
+def cmd_queue_followup(cfg, a):
+    args = {"target_id": a.target_id, "note": a.note, "channel": a.channel, "days": a.days}
+    if a.sequence:
+        args["sequence_id"] = a.sequence
+    print(mcp(cfg, "queue_followup", args))
+
+
+def cmd_reply(cfg, a):
+    print(mcp(cfg, "register_reply", {"target_id": a.target_id, "channel": a.channel, "content": a.content or ""}))
+
+
+def cmd_tool(cfg, a):
+    args = json.loads(a.json) if a.json else {}
+    print(mcp(cfg, a.name, args))
+
+
+def cmd_imessage(cfg, a):
+    # Ask Motion to build + log the send, then run the returned osascript LOCALLY.
+    text = mcp(cfg, "send_imessage", {"target_id": a.id, "message": a.message})
+    if "osascript" not in text:
+        print(text)  # e.g. "No phone number on file…"
+        return
+    # Extract the ```bash … ``` block Motion returned.
+    try:
+        block = text.split("```bash", 1)[1].split("```", 1)[0].strip()
+    except IndexError:
+        die("unexpected response from Motion:\n" + text)
+    if sys.platform != "darwin":
+        print("Run this on your Mac to send:\n\n" + block)
+        return
+    r = subprocess.run(["/bin/bash", "-c", block], capture_output=True, text=True)
+    if r.returncode == 0:
+        print("Sent. (Logged to their timeline.)")
+    else:
+        die("send failed — is Messages open and signed in?\n" + (r.stderr or r.stdout))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="motion", description="Motion CRM — command line")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    lp = sub.add_parser("login", help="sign in with Google (OAuth)")
+    lp.add_argument("--url", help="Motion instance URL (default: hosted)")
+    lp.set_defaults(fn=cmd_login)
+    sub.add_parser("logout", help="remove local credentials").set_defaults(fn=cmd_logout)
+    sub.add_parser("whoami", help="show the signed-in account").set_defaults(fn=cmd_whoami)
+
+    sub.add_parser("agenda", help="open follow-ups, soonest first").set_defaults(fn=cmd_agenda)
+    sub.add_parser("queue", help="scheduled follow-up queue").set_defaults(fn=cmd_queue)
+    sub.add_parser("due", help="steps due to send now").set_defaults(fn=cmd_due)
+    sub.add_parser("channels", help="connected messaging channels").set_defaults(fn=cmd_channels)
+
+    sp = sub.add_parser("search", help="search contacts + context"); sp.add_argument("query"); sp.set_defaults(fn=cmd_search)
+    cp = sub.add_parser("contacts", help="list/search contacts"); cp.add_argument("query", nargs="?"); cp.set_defaults(fn=cmd_contacts)
+    bp = sub.add_parser("brief", help="full dossier on a contact"); bp.add_argument("id", type=int); bp.set_defaults(fn=cmd_brief)
+
+    gp = sub.add_parser("log", help="log context on a contact (creates them if new)")
+    gp.add_argument("target"); gp.add_argument("content")
+    gp.add_argument("--kind", default="note"); gp.add_argument("--follow-up", dest="follow_up")
+    gp.add_argument("--due", help="follow-up due date YYYY-MM-DD"); gp.set_defaults(fn=cmd_log)
+
+    ep = sub.add_parser("send-email", help="send email via your connected inbox")
+    ep.add_argument("to"); ep.add_argument("subject"); ep.add_argument("body")
+    ep.add_argument("--target-id", dest="target_id", type=int); ep.set_defaults(fn=cmd_send_email)
+
+    ip = sub.add_parser("imessage", help="send an iMessage from your Mac")
+    ip.add_argument("id", type=int); ip.add_argument("message"); ip.set_defaults(fn=cmd_imessage)
+
+    qp = sub.add_parser("queue-followup", help="schedule a follow-up/outreach step")
+    qp.add_argument("target_id", type=int); qp.add_argument("note")
+    qp.add_argument("--channel", default="manual"); qp.add_argument("--days", type=int, default=3)
+    qp.add_argument("--sequence", type=int); qp.set_defaults(fn=cmd_queue_followup)
+
+    rp = sub.add_parser("reply", help="record a reply (breaks the sequence)")
+    rp.add_argument("target_id", type=int); rp.add_argument("--channel", default="reply")
+    rp.add_argument("--content"); rp.set_defaults(fn=cmd_reply)
+
+    tp = sub.add_parser("tool", help="call any MCP tool directly")
+    tp.add_argument("name"); tp.add_argument("json", nargs="?", help="arguments as a JSON object")
+    tp.set_defaults(fn=cmd_tool)
+
+    a = p.parse_args()
+    a.fn(load_cfg(), a)
+
+
+if __name__ == "__main__":
+    main()
