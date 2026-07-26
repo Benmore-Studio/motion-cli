@@ -9,13 +9,13 @@ It's a thin client over Motion's **MCP** tools, and it authenticates with the sa
 Requires **Python 3.9+** (already on macOS and most Linux). No pip, no packages.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/benmore-tech/motion-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Benmore-Studio/motion-cli/main/install.sh | sh
 ```
 
 Or grab the single file directly:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/benmore-tech/motion-cli/main/motion -o /usr/local/bin/motion
+curl -fsSL https://raw.githubusercontent.com/Benmore-Studio/motion-cli/main/motion -o /usr/local/bin/motion
 chmod +x /usr/local/bin/motion
 ```
 
