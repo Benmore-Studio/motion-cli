@@ -247,7 +247,8 @@ def cmd_log(cfg, a):
 
 
 def cmd_send_email(cfg, a):
-    args = {"to": a.to, "subject": a.subject, "body": a.body}
+    args = {"to": a.to, "subject": a.subject, "body": a.body,
+            "mode": "draft" if a.draft else "send"}
     if a.target_id:
         args["target_id"] = a.target_id
     print(mcp(cfg, "send_email", args))
@@ -271,7 +272,8 @@ def cmd_tool(cfg, a):
 
 def cmd_imessage(cfg, a):
     # Ask Motion to build + log the send, then run the returned osascript LOCALLY.
-    text = mcp(cfg, "send_imessage", {"target_id": a.id, "message": a.message})
+    mode = "draft" if a.draft else "send"
+    text = mcp(cfg, "send_imessage", {"target_id": a.id, "message": a.message, "mode": mode})
     if "osascript" not in text:
         print(text)  # e.g. "No phone number on file…"
         return
@@ -314,12 +316,15 @@ def main():
     gp.add_argument("--kind", default="note"); gp.add_argument("--follow-up", dest="follow_up")
     gp.add_argument("--due", help="follow-up due date YYYY-MM-DD"); gp.set_defaults(fn=cmd_log)
 
-    ep = sub.add_parser("send-email", help="send email via your connected inbox")
+    ep = sub.add_parser("send-email", help="send (or --draft) email via your connected inbox")
     ep.add_argument("to"); ep.add_argument("subject"); ep.add_argument("body")
+    ep.add_argument("--draft", action="store_true", help="file for review instead of sending")
     ep.add_argument("--target-id", dest="target_id", type=int); ep.set_defaults(fn=cmd_send_email)
 
-    ip = sub.add_parser("imessage", help="send an iMessage from your Mac")
-    ip.add_argument("id", type=int); ip.add_argument("message"); ip.set_defaults(fn=cmd_imessage)
+    ip = sub.add_parser("imessage", help="send (or --draft) an iMessage from your Mac")
+    ip.add_argument("id", type=int); ip.add_argument("message")
+    ip.add_argument("--draft", action="store_true", help="file for review instead of sending")
+    ip.set_defaults(fn=cmd_imessage)
 
     qp = sub.add_parser("queue-followup", help="schedule a follow-up/outreach step")
     qp.add_argument("target_id", type=int); qp.add_argument("note")
