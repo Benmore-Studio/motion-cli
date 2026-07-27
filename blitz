@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
-"""motion — a tiny, dependency-free CLI for Motion, the agent-driven personal CRM.
+"""blitz — a tiny, dependency-free CLI for Blitz, your AI Rolodex.
 
-Auth is OAuth 2.1 (PKCE) against your Motion instance's built-in authorization
+Auth is OAuth 2.1 (PKCE) against your Blitz instance's built-in authorization
 server — the same login your AI agent uses. Everything else is a thin call to
-Motion's MCP tools, plus local iMessage sending via AppleScript on macOS.
+Blitz's MCP tools, plus local iMessage sending via AppleScript on macOS.
 
-Config/token live in ~/.config/motion/config.json.
-Point at a different instance with the MOTION_URL env var (default: the hosted app).
+Config/token live in ~/.config/blitz/config.json (an older ~/.config/motion
+config is still read, so an existing login carries over).
+Point at a different instance with BLITZ_URL (MOTION_URL also honoured).
 """
 import argparse, base64, hashlib, http.server, json, os, secrets, socket
-import subprocess, sys, threading, urllib.parse, urllib.request, webbrowser
+import ssl, subprocess, sys, threading, urllib.parse, urllib.request, webbrowser
 
-DEFAULT_URL = os.environ.get("MOTION_URL", "https://motion-v9t7fg.benmore.ai").rstrip("/")
-CFG_DIR = os.path.expanduser("~/.config/motion")
+DEFAULT_URL = os.environ.get("BLITZ_URL", os.environ.get(
+    "MOTION_URL", "https://www.getblitz.app")).rstrip("/")
+CFG_DIR = os.path.expanduser("~/.config/blitz")
 CFG_PATH = os.path.join(CFG_DIR, "config.json")
+# Pre-rebrand location — read-only fallback so an existing login still works.
+LEGACY_CFG_PATH = os.path.expanduser("~/.config/motion/config.json")
+USER_AGENT = "Blitz-CLI/1.0"
 
 
 # ---------- config ----------
 def load_cfg():
-    try:
-        with open(CFG_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    for path in (CFG_PATH, LEGACY_CFG_PATH):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return {}
 
 
 def save_cfg(cfg):
@@ -37,8 +44,25 @@ def base_url(cfg):
 
 
 # ---------- http ----------
+def ssl_ctx():
+    """Trust store for outbound TLS.
+
+    A python.org build on macOS ships without a usable CA bundle until the
+    bundled `Install Certificates.command` is run, which otherwise surfaces as
+    an unreadable SSLCertVerificationError traceback. Prefer certifi's bundle
+    when it's importable, else fall back to the system default.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
 def http(method, url, token=None, body=None, form=False):
-    data, headers = None, {"Accept": "application/json"}
+    # An explicit User-Agent is REQUIRED: Cloudflare blocks urllib's default
+    # ("Python-urllib/x.y") with error 1010 before the request reaches the app.
+    data, headers = None, {"Accept": "application/json", "User-Agent": USER_AGENT}
     if token:
         headers["Authorization"] = "Bearer " + token
     if body is not None:
@@ -50,7 +74,7 @@ def http(method, url, token=None, body=None, form=False):
             headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req) as r:
+        with urllib.request.urlopen(req, context=ssl_ctx(), timeout=60) as r:
             raw = r.read().decode()
     except urllib.error.HTTPError as e:
         raw = e.read().decode()
@@ -58,6 +82,15 @@ def http(method, url, token=None, body=None, form=False):
             return e.code, json.loads(raw)
         except Exception:
             return e.code, {"error": raw[:400]}
+    except ssl.SSLCertVerificationError:
+        die("TLS certificate verification failed.\n"
+            "  Your Python has no CA bundle. Fix with either:\n"
+            "    python3 -m pip install --upgrade certifi\n"
+            "    open \"/Applications/Python 3.x/Install Certificates.command\"")
+    except urllib.error.URLError as e:
+        die("could not reach %s (%s)" % (urllib.parse.urlparse(url).netloc, e.reason))
+    except socket.timeout:
+        die("request to %s timed out" % urllib.parse.urlparse(url).netloc)
     try:
         return 200, json.loads(raw)
     except Exception:
@@ -65,14 +98,14 @@ def http(method, url, token=None, body=None, form=False):
 
 
 def die(msg, code=1):
-    print("motion: " + msg, file=sys.stderr)
+    print("blitz: " + msg, file=sys.stderr)
     sys.exit(code)
 
 
 def need_token(cfg):
     tok = cfg.get("token")
     if not tok:
-        die("not logged in — run `motion login` first")
+        die("not logged in — run `blitz login` first")
     return tok
 
 
@@ -84,7 +117,7 @@ def mcp(cfg, tool, args):
             "params": {"name": tool, "arguments": args}}
     code, resp = http("POST", url, token=tok, body=body)
     if code == 401:
-        die("session expired — run `motion login` again")
+        die("session expired — run `blitz login` again")
     if code != 200 or not isinstance(resp, dict):
         die("request failed (%s): %s" % (code, resp))
     if "error" in resp:
@@ -112,7 +145,7 @@ def cmd_login(cfg, a):
     base = (a.url or DEFAULT_URL).rstrip("/")
     code, meta = http("GET", base + "/.well-known/oauth-authorization-server")
     if code != 200 or not isinstance(meta, dict):
-        die("could not reach Motion's OAuth server at " + base)
+        die("could not reach Blitz's OAuth server at " + base)
     authorize = meta["authorization_endpoint"]
     token_ep = meta["token_endpoint"]
     register = meta.get("registration_endpoint", base + "/oauth/register")
@@ -122,7 +155,7 @@ def cmd_login(cfg, a):
 
     # Dynamic client registration (public client, PKCE, no secret).
     code, reg = http("POST", register, body={
-        "client_name": "Motion CLI", "redirect_uris": [redirect],
+        "client_name": "Blitz CLI", "redirect_uris": [redirect],
         "grant_types": ["authorization_code"], "response_types": ["code"],
         "token_endpoint_auth_method": "none",
     })
@@ -158,7 +191,7 @@ def cmd_login(cfg, a):
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(b"<html><body style='font-family:system-ui;text-align:center;"
-                             b"padding-top:20vh'><h2>Motion connected \xe2\x9c\x93</h2>"
+                             b"padding-top:20vh'><h2>Blitz connected \xe2\x9c\x93</h2>"
                              b"<p>You can close this tab and return to your terminal.</p></body></html>")
 
     srv = http.server.HTTPServer(("127.0.0.1", port), Handler)
@@ -191,14 +224,15 @@ def cmd_login(cfg, a):
     # Confirm who we are.
     _, who = http("GET", base + "/api/_auth/profile", token=cfg["token"])
     email = who.get("email", "") if isinstance(who, dict) else ""
-    print("Logged in%s. You're set — try `motion agenda`." % ((" as " + email) if email else ""))
+    print("Logged in%s. You're set — try `blitz agenda`." % ((" as " + email) if email else ""))
 
 
 def cmd_logout(cfg, a):
-    try:
-        os.remove(CFG_PATH)
-    except FileNotFoundError:
-        pass
+    for path in (CFG_PATH, LEGACY_CFG_PATH):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
     print("Logged out.")
 
 
@@ -271,17 +305,17 @@ def cmd_tool(cfg, a):
 
 
 def cmd_imessage(cfg, a):
-    # Ask Motion to build + log the send, then run the returned osascript LOCALLY.
+    # Ask Blitz to build + log the send, then run the returned osascript LOCALLY.
     mode = "draft" if a.draft else "send"
     text = mcp(cfg, "send_imessage", {"target_id": a.id, "message": a.message, "mode": mode})
     if "osascript" not in text:
         print(text)  # e.g. "No phone number on file…"
         return
-    # Extract the ```bash … ``` block Motion returned.
+    # Extract the ```bash … ``` block Blitz returned.
     try:
         block = text.split("```bash", 1)[1].split("```", 1)[0].strip()
     except IndexError:
-        die("unexpected response from Motion:\n" + text)
+        die("unexpected response from Blitz:\n" + text)
     if sys.platform != "darwin":
         print("Run this on your Mac to send:\n\n" + block)
         return
@@ -293,11 +327,11 @@ def cmd_imessage(cfg, a):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="motion", description="Motion CRM — command line")
+    p = argparse.ArgumentParser(prog="blitz", description="Blitz — your AI Rolodex, on the command line")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     lp = sub.add_parser("login", help="sign in with Google (OAuth)")
-    lp.add_argument("--url", help="Motion instance URL (default: hosted)")
+    lp.add_argument("--url", help="Blitz instance URL (default: hosted)")
     lp.set_defaults(fn=cmd_login)
     sub.add_parser("logout", help="remove local credentials").set_defaults(fn=cmd_logout)
     sub.add_parser("whoami", help="show the signed-in account").set_defaults(fn=cmd_whoami)
